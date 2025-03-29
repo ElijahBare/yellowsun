@@ -2,8 +2,15 @@
 
 #[cfg(feature = "native")]
 use libc::{
-    self, c_void, MADV_HUGEPAGE, MAP_ANONYMOUS, MAP_HUGETLB, MAP_PRIVATE, PROT_READ, PROT_WRITE,
+    self, c_void, MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE,
 };
+
+// Define constants for portability if not found in libc
+#[cfg(feature = "native")]
+const MADV_HUGEPAGE: libc::c_int = 14;
+
+#[cfg(feature = "native")]
+const MAP_HUGETLB: libc::c_int = 0x40000;
 use std::mem::size_of;
 use std::ops::{Deref, DerefMut};
 use std::ptr::{self, NonNull};

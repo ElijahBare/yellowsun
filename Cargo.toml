@@ -1,13 +1,13 @@
 [package]
-name = "yellowsun"
+name = "yellowsun-wasm"
 version = "0.2.3"
-authors = ["Kaz Wesley <keziahw@gmail.com>"]
+authors = ["Kaz Wesley <keziahw@gmail.com>", "Elijah Bare"]
 license = "MIT/Apache-2.0"
 edition = "2018"
 description = "CryptoNight hash implementation for Monero and related cryptocurrency"
 keywords = ["crypto", "hash", "monero"]
 categories = ["cryptography"]
-repository = "https://github.com/kazcw/yellowsun"
+repository = "https://github.com/ElijahBare/yellowsun"
 
 [dependencies]
 groestl-aesni = { version = "0.2", optional = true }
@@ -51,6 +51,5 @@ crate-type = ["cdylib", "rlib"]
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
 
-# When compiling for WASM, automatically enable the "wasm" feature
-[target.'cfg(target_arch = "wasm32")'.features]
-default = ["wasm"]
+# Note: target-specific features aren't supported, so we use conditional compilation in the code instead
+# If target is wasm32, the code will use the wasm feature automatically

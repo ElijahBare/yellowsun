@@ -44,7 +44,7 @@ impl From<GenericArray<u8, U200>> for State {
 }
 
 // Support for SHA3 digest from blake_hash's GenericArray
-#[cfg(feature = "wasm")]
+#[cfg(any(feature = "wasm", not(feature = "native")))]
 impl From<sha3::digest::generic_array::GenericArray<u8, sha3::digest::generic_array::typenum::U32>> for State {
     fn from(gen_array: sha3::digest::generic_array::GenericArray<u8, sha3::digest::generic_array::typenum::U32>) -> State {
         let mut state = State::default();
@@ -54,6 +54,19 @@ impl From<sha3::digest::generic_array::GenericArray<u8, sha3::digest::generic_ar
         }
         state
     }
+}
+
+// Generic function to initialize state from a hash result
+pub fn init_state_from_digest(digest_bytes: &[u8]) -> State {
+    let mut state = State::default();
+    unsafe {
+        for i in 0..digest_bytes.len() {
+            if i < 200 {
+                state.u8_array[i] = digest_bytes[i];
+            }
+        }
+    }
+    state
 }
 
 impl<'a> From<&'a State> for &'a [u8; 200] {
