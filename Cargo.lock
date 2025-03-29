@@ -451,7 +451,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "yellowsun-wasm"
+name = "yellowsun"
 version = "0.2.3"
 dependencies = [
  "blake-hash",

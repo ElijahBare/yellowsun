@@ -1,5 +1,5 @@
 [package]
-name = "yellowsun-wasm"
+name = "yellowsun"
 version = "0.2.3"
 authors = ["Kaz Wesley <keziahw@gmail.com>", "Elijah Bare"]
 license = "MIT/Apache-2.0"
