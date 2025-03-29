@@ -38,8 +38,19 @@ required-features = ["dev"]
 [profile.test]
 opt-level = 2
 
+[profile.release]
+# Tell `rustc` to optimize for small code size.
+opt-level = "s"
+lto = true
+codegen-units = 1
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+# Enable WASM target specific dependencies
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
+
+# When compiling for WASM, automatically enable the "wasm" feature
+[target.'cfg(target_arch = "wasm32")'.features]
+default = ["wasm"]

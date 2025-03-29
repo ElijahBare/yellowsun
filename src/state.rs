@@ -14,10 +14,10 @@ type i64x2 = [u64; 2];
 #[repr(C, align(128))]
 pub union State {
     // full-size (array interface)
-    u8_array: [u8; 200],
-    u64_array: [u64; 25],
+    pub u8_array: [u8; 200],
+    pub u64_array: [u64; 25],
     // partial!
-    i64x2_array: [i64x2; 12],
+    pub i64x2_array: [i64x2; 12],
 }
 
 impl Default for State {
@@ -40,6 +40,19 @@ impl From<GenericArray<u8, U200>> for State {
         State {
             u8_array: unsafe { mem::transmute(gen_array) },
         }
+    }
+}
+
+// Support for SHA3 digest from blake_hash's GenericArray
+#[cfg(feature = "wasm")]
+impl From<sha3::digest::generic_array::GenericArray<u8, sha3::digest::generic_array::typenum::U32>> for State {
+    fn from(gen_array: sha3::digest::generic_array::GenericArray<u8, sha3::digest::generic_array::typenum::U32>) -> State {
+        let mut state = State::default();
+        // Copy the 32 bytes from SHA3 digest into our state
+        unsafe {
+            state.u8_array[..32].copy_from_slice(gen_array.as_slice());
+        }
+        state
     }
 }
 
