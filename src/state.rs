@@ -4,7 +4,11 @@
 
 use skein_hash::digest::generic_array::typenum::U200;
 use skein_hash::GenericArray;
+
+#[cfg(all(feature = "native", target_arch = "x86_64"))]
 use std::arch::x86_64::__m128i as i64x2;
+#[cfg(not(all(feature = "native", target_arch = "x86_64")))]
+type i64x2 = [u64; 2];
 
 #[derive(Clone, Copy)]
 #[repr(C, align(128))]

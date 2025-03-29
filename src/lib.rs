@@ -7,8 +7,7 @@ extern crate test;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-#[cfg(all(feature = "native", target_arch = "x86_64"))]
-#[cfg(target_feature = "sse2")]
+#[cfg(all(feature = "native", target_arch = "x86_64", target_feature = "sse2"))]
 mod cn_aesni;
 mod mmap;
 mod state;
@@ -18,9 +17,9 @@ mod wasm;
 use blake_hash::digest::Digest;
 use skein_hash::digest::generic_array::typenum::U32;
 use skein_hash::digest::generic_array::GenericArray;
-#[cfg(feature = "native")]
+#[cfg(all(feature = "native", target_arch = "x86_64"))]
 use std::arch::x86_64::__m128i as i64x2;
-#[cfg(feature = "wasm")]
+#[cfg(not(all(feature = "native", target_arch = "x86_64")))]
 type i64x2 = [u64; 2];
 use std::str::FromStr;
 
@@ -86,39 +85,41 @@ pub use crate::mmap::Policy as AllocPolicy;
 
 pub struct Hasher(Hasher_);
 enum Hasher_ {
+    #[cfg(all(feature = "native", target_arch = "x86_64", target_feature = "sse2"))]
     CryptoNight0 { memory: Mmap<[i64x2; 1 << 17]> },
     //CryptoNight1{ memory: Mmap<[i64x2; 1 << 17]> },
+    #[cfg(all(feature = "native", target_arch = "x86_64", target_feature = "sse2"))]
     CryptoNight2 { memory: Mmap<[i64x2; 1 << 17]> },
-    #[cfg(feature = "wasm")]
+    #[cfg(any(feature = "wasm", not(all(feature = "native", target_arch = "x86_64", target_feature = "sse2"))))]
     WasmCn0 { memory: Mmap<[i64x2; 1 << 17]> },
-    #[cfg(feature = "wasm")]
+    #[cfg(any(feature = "wasm", not(all(feature = "native", target_arch = "x86_64", target_feature = "sse2"))))]
     WasmCn2 { memory: Mmap<[i64x2; 1 << 17]> },
 }
 
 impl Hasher {
     pub fn new(algo: Algo, alloc: AllocPolicy) -> Self {
         Hasher(match algo {
-            #[cfg(feature = "native")]
+            #[cfg(all(feature = "native", target_arch = "x86_64", target_feature = "sse2"))]
             Algo::Cn0 => Hasher_::CryptoNight0 {
                 memory: Mmap::new(alloc),
             },
             //Algo::Cn1 => Hasher_::CryptoNight1 { memory: Mmap::default() },
-            #[cfg(feature = "native")]
+            #[cfg(all(feature = "native", target_arch = "x86_64", target_feature = "sse2"))]
             Algo::Cn2 => Hasher_::CryptoNight2 {
                 memory: Mmap::new(alloc),
             },
-            #[cfg(feature = "wasm")]
+            #[cfg(any(feature = "wasm", not(all(feature = "native", target_arch = "x86_64", target_feature = "sse2"))))]
             Algo::Cn0 => Hasher_::WasmCn0 {
                 memory: Mmap::new(alloc),
             },
-            #[cfg(feature = "wasm")]
+            #[cfg(any(feature = "wasm", not(all(feature = "native", target_arch = "x86_64", target_feature = "sse2"))))]
             Algo::Cn2 => Hasher_::WasmCn2 {
                 memory: Mmap::new(alloc),
             },
         })
     }
 
-    #[cfg(feature = "native")]
+    #[cfg(all(feature = "native", target_arch = "x86_64", target_feature = "sse2"))]
     pub fn hashes<'a, Noncer: Iterator<Item = u32> + 'static>(
         &'a mut self,
         mut blob: Box<[u8]>,
@@ -140,10 +141,11 @@ impl Hasher {
                     CryptoNight::<_, cn_aesni::Cnv2>::new(noncer, &mut memory[..], &mut blob[..]);
                 Hashes::new(&mut memory[..], blob, Box::new(algo))
             }
+            _ => unreachable!(),
         }
     }
 
-    #[cfg(feature = "wasm")]
+    #[cfg(any(feature = "wasm", not(all(feature = "native", target_arch = "x86_64", target_feature = "sse2"))))]
     pub fn hashes<'a, Noncer: Iterator<Item = u32> + 'static>(
         &'a mut self,
         mut blob: Box<[u8]>,
@@ -170,10 +172,20 @@ impl Hasher {
         }
         
         match &mut self.0 {
+            #[cfg(feature = "wasm")]
             Hasher_::WasmCn0 { memory } | Hasher_::WasmCn2 { memory } => {
                 Hashes::new(&mut memory[..], blob, Box::new(WasmHasher { hash }))
             }
-            _ => unreachable!(),
+            #[cfg(not(feature = "wasm"))]
+            _ => {
+                // When building for non-WASM targets without x86_64/SSE2
+                // We still need to return something valid
+                let memory = match &mut self.0 {
+                    Hasher_::WasmCn0 { memory } | Hasher_::WasmCn2 { memory } => memory,
+                    _ => unreachable!(),
+                };
+                Hashes::new(&mut memory[..], blob, Box::new(WasmHasher { hash }))
+            }
         }
     }
 }
@@ -203,12 +215,15 @@ trait Impl {
     fn next_hash(&mut self, memory: &mut [i64x2], blob: &mut [u8]) -> GenericArray<u8, U32>;
 }
 
+#[cfg(all(feature = "native", target_arch = "x86_64", target_feature = "sse2"))]
 #[derive(Default)]
 struct CryptoNight<Noncer, Variant> {
     state: State,
     variant: Variant,
     n: Noncer,
 }
+
+#[cfg(all(feature = "native", target_arch = "x86_64", target_feature = "sse2"))]
 impl<Noncer: Iterator<Item = u32>, Variant: cn_aesni::Variant> CryptoNight<Noncer, Variant> {
     fn new(mut n: Noncer, mem: &mut [i64x2], blob: &mut [u8]) -> Self {
         set_nonce(blob, n.next().unwrap());
@@ -218,6 +233,8 @@ impl<Noncer: Iterator<Item = u32>, Variant: cn_aesni::Variant> CryptoNight<Nonce
         CryptoNight { state, variant, n }
     }
 }
+
+#[cfg(all(feature = "native", target_arch = "x86_64", target_feature = "sse2"))]
 impl<Noncer: Iterator<Item = u32>, Variant: cn_aesni::Variant> Impl
     for CryptoNight<Noncer, Variant>
 {
@@ -235,7 +252,7 @@ impl<Noncer: Iterator<Item = u32>, Variant: cn_aesni::Variant> Impl
     }
 }
 
-#[cfg(feature = "native")]
+#[cfg(all(feature = "native", target_arch = "x86_64", target_feature = "sse2"))]
 pub fn hash<V: cn_aesni::Variant>(blob: &[u8]) -> GenericArray<u8, U32> {
     let mut mem = Mmap::<[i64x2; 1 << 17]>::new(AllocPolicy::AllowSlow);
     let mut state = State::from(sha3::Keccak256Full::digest(blob));
@@ -258,7 +275,7 @@ pub fn hash_cn2_impl(blob: &[u8]) -> GenericArray<u8, U32> {
     finalize(state)
 }
 
-#[cfg(test)]
+#[cfg(all(test, all(feature = "native", target_arch = "x86_64", target_feature = "sse2")))]
 mod tests {
     use super::*;
 
