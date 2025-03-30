@@ -10,7 +10,11 @@ use std::fmt::Debug;
 use std::str::FromStr;
 use wasm_bindgen::prelude::*;
 
-// Define our non-SIMD 128-bit type
+// Import SIMD intrinsics for wasm32.
+#[cfg(target_arch = "wasm32")]
+use core::arch::wasm32::*;
+
+/// Define our non-SIMD 128-bit type.
 #[derive(Copy, Clone, Debug)]
 pub struct M128i(pub u64, pub u64);
 
@@ -30,6 +34,68 @@ fn mul64(x: u64, y: u64) -> (u64, u64) {
     let hi = (u128::from(x).wrapping_mul(u128::from(y)) >> 64) as u64;
     (lo, hi)
 }
+
+/// SIMD helper: Convert an M128i into a v128.
+/// (Reinterprets the two u64 lanes as i64.)
+#[target_feature(enable = "simd128")]
+unsafe fn m128i_to_v128(x: M128i) -> v128 {
+    // Use the stable intrinsic: i64x2
+    i64x2(x.0 as i64, x.1 as i64)
+}
+
+/// SIMD helper: Convert a v128 back into an M128i.
+#[target_feature(enable = "simd128")]
+unsafe fn v128_to_m128i(x: v128) -> M128i {
+    M128i(
+        i64x2_extract_lane::<0>(x) as u64,
+        i64x2_extract_lane::<1>(x) as u64,
+    )
+}
+
+/// SIMD helper: Logical (unsigned) shift right for each 64-bit lane.
+/// Since WebAssembly provides only arithmetic shift right (i64x2_shr),
+/// we emulate a logical shift right by masking off the sign extension.
+#[target_feature(enable = "simd128")]
+unsafe fn simd_shr_u(x: v128, shift: u32) -> v128 {
+    let arithmetic = i64x2_shr(x, shift);
+    // Compute mask = (1 << (64 - shift)) - 1, except if shift==0 then mask = all ones.
+    let mask: u64 = if shift == 0 {
+        u64::MAX
+    } else {
+        (1u64 << (64 - shift)) - 1
+    };
+    let mask_v = i64x2(mask as i64, mask as i64);
+    v128_and(arithmetic, mask_v)
+}
+
+/// SIMD rotate left for each 64-bit lane.
+/// Implements: (x << shift) | (x >> (64 - shift))
+#[target_feature(enable = "simd128")]
+unsafe fn simd_rotate_left(x: v128, shift: u32) -> v128 {
+    let left = i64x2_shl(x, shift);
+    let right = simd_shr_u(x, 64 - shift);
+    v128_or(left, right)
+}
+
+/// SIMD-accelerated AES round.
+/// We rotate the first operand left by 13 bits and the second operand right by 7 bits (via left rotate by 57),
+/// then XOR them.
+#[target_feature(enable = "simd128")]
+unsafe fn aes_round_simd(a: M128i, b: M128i) -> M128i {
+    let a_v = m128i_to_v128(a);
+    let b_v = m128i_to_v128(b);
+    let a_rot = simd_rotate_left(a_v, 13);
+    let b_rot = simd_rotate_left(b_v, 57); // 57 = 64 - 7
+    let res = v128_xor(a_rot, b_rot);
+    v128_to_m128i(res)
+}
+
+/// Our aes_round now calls the SIMD version.
+fn aes_round(a: M128i, b: M128i) -> M128i {
+    unsafe { aes_round_simd(a, b) }
+}
+
+// --- Rest of your CryptoNight code remains largely the same ---
 
 pub trait CryptoVariant: Default + Clone + Debug {
     fn new(blob: &[u8], state: &[u64; 25]) -> Self;
@@ -89,7 +155,6 @@ impl Default for Cnv2 {
 
 #[inline(always)]
 fn int_sqrt_v2(input: u64) -> u32 {
-    // Fallback for non-SIMD platforms; note that you might consider a pure integer algorithm.
     let r = (input as f64).sqrt() as u64;
     let s = r >> 1;
     let b = r & 1;
@@ -101,7 +166,6 @@ fn int_sqrt_v2(input: u64) -> u32 {
 
 impl CryptoVariant for Cnv2 {
     fn new(_blob: &[u8], state: &[u64; 25]) -> Self {
-        // Extract state values and combine with XOR (mimics _mm_xor_si128)
         let bb1 = M128i(state[8] ^ state[10], state[9] ^ state[11]);
         Cnv2 {
             bb1,
@@ -112,12 +176,10 @@ impl CryptoVariant for Cnv2 {
             j3: M128i(0, 0),
         }
     }
-
     #[inline(always)]
     fn pre_mul(&mut self, b0: u64) -> u64 {
         b0 ^ self.div ^ (u64::from(self.sqr) << 32)
     }
-
     #[inline(always)]
     fn int_math(&mut self, c0: u64, c1: u64) {
         let dividend = c1;
@@ -126,17 +188,14 @@ impl CryptoVariant for Cnv2 {
             + ((dividend % u64::from(divisor)) << 32);
         self.sqr = int_sqrt_v2(c0.wrapping_add(self.div));
     }
-
     #[inline(always)]
     fn reads(&mut self, mem: &[M128i], j: u32) {
         self.j1 = mem[(j ^ 1) as usize];
         self.j2 = mem[(j ^ 2) as usize];
         self.j3 = mem[(j ^ 3) as usize];
     }
-
     #[inline(always)]
     fn writes(&self, mem: &mut [M128i], j: u32, bb: M128i, aa: M128i) {
-        // Addition (_mm_add_epi64 equivalent)
         mem[(j ^ 1) as usize] = M128i(
             self.j3.0.wrapping_add(self.bb1.0),
             self.j3.1.wrapping_add(self.bb1.1),
@@ -144,25 +203,22 @@ impl CryptoVariant for Cnv2 {
         mem[(j ^ 2) as usize] = M128i(self.j1.0.wrapping_add(bb.0), self.j1.1.wrapping_add(bb.1));
         mem[(j ^ 3) as usize] = M128i(self.j2.0.wrapping_add(aa.0), self.j2.1.wrapping_add(aa.1));
     }
-
     #[inline(always)]
     fn post_mul(&mut self, lo: u64, hi: u64) -> M128i {
         self.j1 = M128i(lo ^ self.j1.0, hi ^ self.j1.1);
         M128i(lo ^ self.j2.0, hi ^ self.j2.1)
     }
-
     #[inline(always)]
     fn end_iter(&mut self, bb: M128i) {
         self.bb1 = bb;
     }
-
     #[inline(always)]
     fn mem_size() -> u32 {
         0x20_0000
     }
 }
 
-// Simple wrappers for rotate operations as const functions
+/// Simple wrappers for rotate operations.
 const fn rotate_left(value: u64, shift: u32) -> u64 {
     value.rotate_left(shift)
 }
@@ -170,6 +226,7 @@ const fn rotate_right(value: u64, shift: u32) -> u64 {
     value.rotate_right(shift)
 }
 
+/// Create lookup tables for rotate operations.
 const fn create_rotate_left_table(shift: u32) -> [u64; 64] {
     let mut table = [0u64; 64];
     let mut i = 0;
@@ -195,64 +252,36 @@ static ROTATE_RIGHT_7: [u64; 64] = create_rotate_right_table(7);
 static ROTATE_LEFT_17: [u64; 64] = create_rotate_left_table(17);
 static ROTATE_RIGHT_11: [u64; 64] = create_rotate_right_table(11);
 
-#[inline(always)]
-fn aes_round(a: M128i, b: M128i) -> M128i {
-    // If the values are small, use precomputed lookup tables; otherwise, use hardware rotations.
-    let a0 = if a.0 < 64 && b.0 < 64 {
-        ROTATE_LEFT_13[(a.0 & 0x3F) as usize] ^ ROTATE_RIGHT_7[(b.0 & 0x3F) as usize]
-    } else {
-        a.0.rotate_left(13) ^ b.0.rotate_right(7)
-    };
-    let a1 = if a.1 < 64 && b.1 < 64 {
-        ROTATE_LEFT_17[(a.1 & 0x3F) as usize] ^ ROTATE_RIGHT_11[(b.1 & 0x3F) as usize]
-    } else {
-        a.1.rotate_left(17) ^ b.1.rotate_right(11)
-    };
-    M128i(a0, a1)
-}
-
+/// The mix function now uses our SIMD-accelerated aes_round.
 #[inline(always)]
 fn mix<V: CryptoVariant>(mem: &mut [M128i], from: &[M128i], mut var: V) {
-    // Non-SIMD fallback implementation
     let mut aa = M128i(from[0].0 ^ from[2].0, from[0].1 ^ from[2].1);
     let mut bb = M128i(from[1].0 ^ from[3].0, from[1].1 ^ from[3].1);
     for _ in 0..ITERS {
         let a0 = aa.0 as u32;
         let j = (a0 & (V::mem_size() - 0x10)) >> 4;
-
         let cc = aes_round(mem[j as usize], aa);
-
         var.reads(mem, j);
         var.writes(mem, j, bb, aa);
-
         mem[j as usize] = M128i(bb.0 ^ cc.0, bb.1 ^ cc.1);
-
         let c0 = cc.0;
         let c1 = cc.1;
-
         let j = ((c0 as u32) & (V::mem_size() - 0x10)) >> 4;
         var.reads(mem, j);
-
         let b0 = var.pre_mul(mem[j as usize].0);
         let (lo, hi) = mul64(c0, b0);
         let lohi = var.post_mul(lo, hi);
-
         var.writes(mem, j, bb, aa);
-
         aa = M128i(aa.0.wrapping_add(lohi.0), aa.1.wrapping_add(lohi.1));
         mem[j as usize] = aa;
-
         var.end_iter(bb);
         aa = M128i(aa.0 ^ mem[j as usize].1, aa.1 ^ b0);
         bb = cc;
-
         var.int_math(c0, c1);
     }
 }
 
-// Simplified key generation routines without SIMD
 fn genkey(k0: M128i, k1: M128i) -> [M128i; 10] {
-    // Update key using three rounds in a loop instead of unrolling
     fn update_key(mut xmm0: M128i, xmm2: M128i) -> M128i {
         for _ in 0..3 {
             let xmm3 = M128i(xmm0.0 << 32, (xmm0.1 << 32) | (xmm0.0 >> 32));
@@ -283,7 +312,6 @@ fn genkey(k0: M128i, k1: M128i) -> [M128i; 10] {
 
 #[inline(always)]
 fn transplode(into: &mut [M128i], mem: &mut [M128i], from: &[M128i]) {
-    // With fixed state sizes we can remove redundant bounds checks.
     let key_into = genkey(into[2], into[3]);
     let key_from = genkey(from[0], from[1]);
     for m in mem.chunks_exact_mut(8) {
@@ -344,7 +372,6 @@ fn implode(into: &mut [M128i], mem: &[M128i]) {
     }
 }
 
-// State structure
 #[repr(C)]
 #[derive(Default, Clone)]
 pub struct State([u64; 25]);
@@ -359,11 +386,9 @@ impl State {
             self.0[i] ^= v;
         }
     }
-
     pub fn as_bytes(&self) -> &[u8; 200] {
         unsafe { &*(self.0.as_ptr() as *const [u8; 200]) }
     }
-
     pub fn as_m128i_array(&self) -> &[M128i] {
         unsafe {
             std::slice::from_raw_parts(
@@ -372,7 +397,6 @@ impl State {
             )
         }
     }
-
     pub fn as_m128i_array_mut(&mut self) -> &mut [M128i] {
         unsafe {
             std::slice::from_raw_parts_mut(
@@ -381,13 +405,11 @@ impl State {
             )
         }
     }
-
     pub fn as_u64_array(&self) -> &[u64; 25] {
         &self.0
     }
 }
 
-// Optimized state creation using 8-byte chunks (first 200 bytes)
 fn create_state_from_bytes(blob: &[u8]) -> State {
     let mut state = State::default();
     let len = std::cmp::min(blob.len(), 200);
@@ -462,7 +484,6 @@ impl Hasher {
             },
         })
     }
-
     pub fn hashes<'a, Noncer: Iterator<Item = u32> + 'static>(
         &'a mut self,
         mut blob: Box<[u8]>,
@@ -556,7 +577,7 @@ pub fn hash<V: CryptoVariant>(blob: &[u8]) -> [u8; 32] {
     finalize(state_copy)
 }
 
-// WebAssembly simple memory allocation
+/// WebAssembly simple memory allocation.
 pub struct Mmap<T> {
     data: Vec<u8>,
     _phantom: std::marker::PhantomData<T>,
@@ -593,8 +614,6 @@ impl<T: Sized> std::ops::DerefMut for Mmap<T> {
     }
 }
 
-// WebAssembly bindings
-
 #[wasm_bindgen]
 #[derive(Serialize, Deserialize)]
 pub struct MiningResult {
@@ -618,7 +637,6 @@ impl MiningResult {
 pub fn hash_cn0_wasm(data: &[u8]) -> Vec<u8> {
     hash_cn0(data).to_vec()
 }
-
 #[wasm_bindgen]
 pub fn hash_cn2_wasm(data: &[u8]) -> Vec<u8> {
     hash_cn2(data).to_vec()
@@ -630,7 +648,6 @@ pub enum WasmAlgo {
     Cn0,
     Cn2,
 }
-
 #[wasm_bindgen]
 pub fn hash_wasm(algo: WasmAlgo, data: &[u8]) -> Vec<u8> {
     match algo {
