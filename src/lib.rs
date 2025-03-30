@@ -89,9 +89,8 @@ impl Default for Cnv2 {
 
 #[inline(always)]
 fn int_sqrt_v2(input: u64) -> u32 {
-    // Fallback for non-SIMD platforms
+    // Fallback for non-SIMD platforms; note that you might consider a pure integer algorithm.
     let r = (input as f64).sqrt() as u64;
-
     let s = r >> 1;
     let b = r & 1;
     let r2 = s.wrapping_mul(s + b).wrapping_add(r << 32);
@@ -102,22 +101,12 @@ fn int_sqrt_v2(input: u64) -> u32 {
 
 impl CryptoVariant for Cnv2 {
     fn new(_blob: &[u8], state: &[u64; 25]) -> Self {
-        // Extract state values
-        let state_8 = state[8];
-        let state_9 = state[9];
-        let state_10 = state[10];
-        let state_11 = state[11];
-
-        // XOR operation equivalent to _mm_xor_si128
-        let bb1 = M128i(state_8 ^ state_10, state_9 ^ state_11);
-
-        let div = state[12];
-        let sqr = state[13] as u32;
-
+        // Extract state values and combine with XOR (mimics _mm_xor_si128)
+        let bb1 = M128i(state[8] ^ state[10], state[9] ^ state[11]);
         Cnv2 {
             bb1,
-            div,
-            sqr,
+            div: state[12],
+            sqr: state[13] as u32,
             j1: M128i(0, 0),
             j2: M128i(0, 0),
             j3: M128i(0, 0),
@@ -131,7 +120,7 @@ impl CryptoVariant for Cnv2 {
 
     #[inline(always)]
     fn int_math(&mut self, c0: u64, c1: u64) {
-        let dividend: u64 = c1;
+        let dividend = c1;
         let divisor = ((c0 as u32).wrapping_add(self.sqr << 1)) | 0x8000_0001;
         self.div = u64::from((dividend / u64::from(divisor)) as u32)
             + ((dividend % u64::from(divisor)) << 32);
@@ -147,20 +136,17 @@ impl CryptoVariant for Cnv2 {
 
     #[inline(always)]
     fn writes(&self, mem: &mut [M128i], j: u32, bb: M128i, aa: M128i) {
-        // Addition equivalent to _mm_add_epi64
+        // Addition (_mm_add_epi64 equivalent)
         mem[(j ^ 1) as usize] = M128i(
             self.j3.0.wrapping_add(self.bb1.0),
             self.j3.1.wrapping_add(self.bb1.1),
         );
-
         mem[(j ^ 2) as usize] = M128i(self.j1.0.wrapping_add(bb.0), self.j1.1.wrapping_add(bb.1));
-
         mem[(j ^ 3) as usize] = M128i(self.j2.0.wrapping_add(aa.0), self.j2.1.wrapping_add(aa.1));
     }
 
     #[inline(always)]
     fn post_mul(&mut self, lo: u64, hi: u64) -> M128i {
-        // XOR operations equivalent to _mm_xor_si128
         self.j1 = M128i(lo ^ self.j1.0, hi ^ self.j1.1);
         M128i(lo ^ self.j2.0, hi ^ self.j2.1)
     }
@@ -176,21 +162,18 @@ impl CryptoVariant for Cnv2 {
     }
 }
 
-// At the top of your file or in a separate module
+// Simple wrappers for rotate operations as const functions
 const fn rotate_left(value: u64, shift: u32) -> u64 {
     value.rotate_left(shift)
 }
-
 const fn rotate_right(value: u64, shift: u32) -> u64 {
     value.rotate_right(shift)
 }
 
-// Create the lookup tables using const functions
 const fn create_rotate_left_table(shift: u32) -> [u64; 64] {
     let mut table = [0u64; 64];
     let mut i = 0;
     while i < 64 {
-        // Each entry represents the rotation of the index value
         table[i] = rotate_left(i as u64, shift);
         i += 1;
     }
@@ -207,7 +190,6 @@ const fn create_rotate_right_table(shift: u32) -> [u64; 64] {
     table
 }
 
-// Define the actual tables
 static ROTATE_LEFT_13: [u64; 64] = create_rotate_left_table(13);
 static ROTATE_RIGHT_7: [u64; 64] = create_rotate_right_table(7);
 static ROTATE_LEFT_17: [u64; 64] = create_rotate_left_table(17);
@@ -215,37 +197,29 @@ static ROTATE_RIGHT_11: [u64; 64] = create_rotate_right_table(11);
 
 #[inline(always)]
 fn aes_round(a: M128i, b: M128i) -> M128i {
-    // For the full 64-bit rotation, we need to use the hardware rotation
-    // but we can optimize by avoiding recomputation for common values
+    // If the values are small, use precomputed lookup tables; otherwise, use hardware rotations.
     let a0 = if a.0 < 64 && b.0 < 64 {
-        // Use lookup table for common cases
         ROTATE_LEFT_13[(a.0 & 0x3F) as usize] ^ ROTATE_RIGHT_7[(b.0 & 0x3F) as usize]
     } else {
-        // Fall back to direct computation for other values
         a.0.rotate_left(13) ^ b.0.rotate_right(7)
     };
-
     let a1 = if a.1 < 64 && b.1 < 64 {
         ROTATE_LEFT_17[(a.1 & 0x3F) as usize] ^ ROTATE_RIGHT_11[(b.1 & 0x3F) as usize]
     } else {
         a.1.rotate_left(17) ^ b.1.rotate_right(11)
     };
-
     M128i(a0, a1)
 }
 
-// WebAssembly-compatible mix function
 #[inline(always)]
 fn mix<V: CryptoVariant>(mem: &mut [M128i], from: &[M128i], mut var: V) {
     // Non-SIMD fallback implementation
     let mut aa = M128i(from[0].0 ^ from[2].0, from[0].1 ^ from[2].1);
     let mut bb = M128i(from[1].0 ^ from[3].0, from[1].1 ^ from[3].1);
-
     for _ in 0..ITERS {
         let a0 = aa.0 as u32;
         let j = (a0 & (V::mem_size() - 0x10)) >> 4;
 
-        // AES encryption round simulation
         let cc = aes_round(mem[j as usize], aa);
 
         var.reads(mem, j);
@@ -259,60 +233,43 @@ fn mix<V: CryptoVariant>(mem: &mut [M128i], from: &[M128i], mut var: V) {
         let j = ((c0 as u32) & (V::mem_size() - 0x10)) >> 4;
         var.reads(mem, j);
 
-        // Extract values as if it was a 128-bit value
-        let b0 = mem[j as usize].0;
-        let b1 = mem[j as usize].1;
-
-        let b0 = var.pre_mul(b0);
+        let b0 = var.pre_mul(mem[j as usize].0);
         let (lo, hi) = mul64(c0, b0);
         let lohi = var.post_mul(lo, hi);
 
         var.writes(mem, j, bb, aa);
 
-        // Add operation equivalent to _mm_add_epi64
         aa = M128i(aa.0.wrapping_add(lohi.0), aa.1.wrapping_add(lohi.1));
         mem[j as usize] = aa;
 
         var.end_iter(bb);
-
-        // XOR operation equivalent to _mm_xor_si128
-        aa = M128i(aa.0 ^ b1, aa.1 ^ b0);
+        aa = M128i(aa.0 ^ mem[j as usize].1, aa.1 ^ b0);
         bb = cc;
 
         var.int_math(c0, c1);
     }
 }
 
-// Generate encryption keys without SIMD
+// Simplified key generation routines without SIMD
 fn genkey(k0: M128i, k1: M128i) -> [M128i; 10] {
-    // Non-SIMD fallback implementation
-    fn update_key(xmm0: M128i, xmm2: M128i) -> M128i {
-        // Software implementation of AES key generation
-        let xmm3 = M128i(xmm0.0 << 32, xmm0.1 << 32 | xmm0.0 >> 32);
-        let xmm0 = M128i(xmm0.0 ^ xmm3.0, xmm0.1 ^ xmm3.1);
-
-        let xmm3 = M128i(xmm3.0 << 32, xmm3.1 << 32 | xmm3.0 >> 32);
-        let xmm0 = M128i(xmm0.0 ^ xmm3.0, xmm0.1 ^ xmm3.1);
-
-        let xmm3 = M128i(xmm3.0 << 32, xmm3.1 << 32 | xmm3.0 >> 32);
-        let xmm0 = M128i(xmm0.0 ^ xmm3.0, xmm0.1 ^ xmm3.1);
-
+    // Update key using three rounds in a loop instead of unrolling
+    fn update_key(mut xmm0: M128i, xmm2: M128i) -> M128i {
+        for _ in 0..3 {
+            let xmm3 = M128i(xmm0.0 << 32, (xmm0.1 << 32) | (xmm0.0 >> 32));
+            xmm0.0 ^= xmm3.0;
+            xmm0.1 ^= xmm3.1;
+        }
         M128i(xmm0.0 ^ xmm2.0, xmm0.1 ^ xmm2.1)
     }
-
-    // Simplified key round term calculation
     fn round_term(round: u8, mask: u8, input: M128i) -> M128i {
-        // This is a very simplified version that just mixes bits
         let val = if round == 0 {
-            input.1 // Use high 64 bits
+            input.1
         } else {
-            input.0.rotate_left((round * 8) as u32) // Rotate based on round
-        };
-
-        let val = val.rotate_left((mask * 4) as u32); // Apply mask
-        M128i(val, val) // Return as M128i
+            input.0.rotate_left((round * 8) as u32)
+        }
+        .rotate_left((mask * 4) as u32);
+        M128i(val, val)
     }
-
     let k2 = update_key(k0, round_term(0x01, 0xFF, k1));
     let k3 = update_key(k1, round_term(0x00, 0xAA, k2));
     let k4 = update_key(k2, round_term(0x02, 0xFF, k3));
@@ -321,100 +278,67 @@ fn genkey(k0: M128i, k1: M128i) -> [M128i; 10] {
     let k7 = update_key(k5, round_term(0x00, 0xAA, k6));
     let k8 = update_key(k6, round_term(0x08, 0xFF, k7));
     let k9 = update_key(k7, round_term(0x00, 0xAA, k8));
-
     [k0, k1, k2, k3, k4, k5, k6, k7, k8, k9]
 }
 
-// WebAssembly-compatible transplode function
 #[inline(always)]
 fn transplode(into: &mut [M128i], mem: &mut [M128i], from: &[M128i]) {
-    // Non-SIMD fallback implementation
+    // With fixed state sizes we can remove redundant bounds checks.
     let key_into = genkey(into[2], into[3]);
     let key_from = genkey(from[0], from[1]);
-
-    // Process memory in chunks of 8
     for m in mem.chunks_exact_mut(8) {
-        // Process each element in the chunk
         for i in 0..8 {
-            if i + 4 < into.len() {
-                into[i + 4] = M128i(into[i + 4].0 ^ m[i].0, into[i + 4].1 ^ m[i].1);
-            }
+            into[i + 4] = M128i(into[i + 4].0 ^ m[i].0, into[i + 4].1 ^ m[i].1);
         }
-
-        // Apply key rounds
-        for &k in &key_into {
+        for &k in key_into.iter() {
             for i in 0..8 {
-                if i + 4 < into.len() {
-                    into[i + 4] = aes_round(into[i + 4], k);
-                }
+                into[i + 4] = aes_round(into[i + 4], k);
             }
         }
-
-        // Apply keys to from array
         let mut from_copy = [M128i(0, 0); 8];
         for i in 0..8 {
-            if i + 4 < from.len() {
-                from_copy[i] = from[i + 4];
+            from_copy[i] = from[i + 4];
+        }
+        for &k in key_from.iter() {
+            for f in from_copy.iter_mut() {
+                *f = aes_round(*f, k);
             }
         }
-
-        for &k in &key_from {
-            for i in 0..8 {
-                from_copy[i] = aes_round(from_copy[i], k);
-            }
-        }
-
-        // Copy results back to memory
         for i in 0..8 {
             m[i] = from_copy[i];
         }
     }
 }
 
-// WebAssembly-compatible explode function
 #[inline(always)]
 fn explode(mem: &mut [M128i], from: &[M128i]) {
-    // Non-SIMD fallback implementation
     let key_from = genkey(from[0], from[1]);
-
     let mut from_copy = [M128i(0, 0); 8];
     for i in 0..8 {
-        if i + 4 < from.len() {
-            from_copy[i] = from[i + 4];
-        }
+        from_copy[i] = from[i + 4];
     }
-
     for m in mem.chunks_exact_mut(8) {
         for k in key_from.iter() {
             for f in from_copy.iter_mut() {
                 *f = aes_round(*f, *k);
             }
         }
-
-        for (i, m) in m.iter_mut().enumerate() {
-            *m = from_copy[i];
+        for (i, m_item) in m.iter_mut().enumerate() {
+            *m_item = from_copy[i];
         }
     }
 }
 
-// WebAssembly-compatible implode function
 #[inline(always)]
 fn implode(into: &mut [M128i], mem: &[M128i]) {
-    // Non-SIMD fallback implementation
     let key_into = genkey(into[2], into[3]);
-
     for m in mem.chunks_exact(8) {
         for i in 0..8 {
-            if i + 4 < into.len() {
-                into[i + 4] = M128i(into[i + 4].0 ^ m[i].0, into[i + 4].1 ^ m[i].1);
-            }
+            into[i + 4] = M128i(into[i + 4].0 ^ m[i].0, into[i + 4].1 ^ m[i].1);
         }
-
-        for k in key_into.iter() {
+        for &k in key_into.iter() {
             for i in 0..8 {
-                if i + 4 < into.len() {
-                    into[i + 4] = aes_round(into[i + 4], *k);
-                }
+                into[i + 4] = aes_round(into[i + 4], k);
             }
         }
     }
@@ -428,16 +352,14 @@ pub struct State([u64; 25]);
 impl State {
     pub fn xor(&mut self, rhs: &[u8; 32]) {
         for i in 0..4 {
-            let start = i * 8;
             let mut v = 0u64;
             for j in 0..8 {
-                v |= (rhs[start + j] as u64) << (j * 8);
+                v |= (rhs[i * 8 + j] as u64) << (j * 8);
             }
             self.0[i] ^= v;
         }
     }
 
-    // Direct access methods
     pub fn as_bytes(&self) -> &[u8; 200] {
         unsafe { &*(self.0.as_ptr() as *const [u8; 200]) }
     }
@@ -465,70 +387,28 @@ impl State {
     }
 }
 
-// Simple memory allocation for WebAssembly
-pub struct Mmap<T> {
-    data: Vec<u8>,
-    _phantom: std::marker::PhantomData<T>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum Policy {
-    RequireFast,
-    AllowSlow,
-}
-
-impl<T> Mmap<T> {
-    pub fn new(_policy: Policy) -> Self {
-        let size = std::mem::size_of::<T>();
-        Mmap {
-            data: vec![0u8; size],
-            _phantom: std::marker::PhantomData,
-        }
-    }
-}
-
-impl<T: Sized> std::ops::Deref for Mmap<T> {
-    type Target = [M128i];
-
-    fn deref(&self) -> &Self::Target {
-        let len = self.data.len() / std::mem::size_of::<M128i>();
-        unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const M128i, len) }
-    }
-}
-
-impl<T: Sized> std::ops::DerefMut for Mmap<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        let len = self.data.len() / std::mem::size_of::<M128i>();
-        unsafe { std::slice::from_raw_parts_mut(self.data.as_mut_ptr() as *mut M128i, len) }
-    }
-}
-
-// Convert from raw bytes to a state
+// Optimized state creation using 8-byte chunks (first 200 bytes)
 fn create_state_from_bytes(blob: &[u8]) -> State {
     let mut state = State::default();
     let len = std::cmp::min(blob.len(), 200);
-
-    for i in 0..len {
-        let byte_idx = i % blob.len();
+    let mut i = 0;
+    while i < len {
         let u64_idx = i / 8;
-        if u64_idx < 25 {
-            state.0[u64_idx] ^= (blob[byte_idx] as u64) << ((i % 8) * 8);
-        }
+        let end = std::cmp::min(i + 8, len);
+        let mut buf = [0u8; 8];
+        buf[..(end - i)].copy_from_slice(&blob[i..end]);
+        state.0[u64_idx] = u64::from_le_bytes(buf);
+        i += 8;
     }
-
     state
 }
 
 fn finalize(data: State) -> [u8; 32] {
-    // Simple hash implementation for WebAssembly
     let mut hash = [0u8; 32];
     let bytes = data.as_bytes();
-
-    // Just use a simple hashing approach for WebAssembly
     for i in 0..32 {
         hash[i] = bytes[i * 3 % 200] ^ bytes[i * 5 % 200] ^ bytes[i * 7 % 200];
     }
-
     hash
 }
 
@@ -552,13 +432,13 @@ pub enum Algo {
 impl FromStr for Algo {
     type Err = UnknownAlgo;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s {
-            "cn/0" => Algo::Cn0,
-            "cn/2" => Algo::Cn2,
+        match s {
+            "cn/0" => Ok(Algo::Cn0),
+            "cn/2" => Ok(Algo::Cn2),
             name => Err(UnknownAlgo {
                 name: name.to_owned().into_boxed_str(),
-            })?,
-        })
+            }),
+        }
     }
 }
 
@@ -634,13 +514,9 @@ struct CryptoNight<Noncer, V> {
 impl<Noncer: Iterator<Item = u32>, V: CryptoVariant> CryptoNight<Noncer, V> {
     fn new(mut n: Noncer, mem: &mut [M128i], blob: &mut [u8]) -> Self {
         set_nonce(blob, n.next().unwrap_or(0));
-
-        // Create a state from the blob
         let state = create_state_from_bytes(blob);
         let variant = V::new(blob, state.as_u64_array());
-
         explode(mem, state.as_m128i_array());
-
         CryptoNight { state, variant, n }
     }
 }
@@ -648,21 +524,16 @@ impl<Noncer: Iterator<Item = u32>, V: CryptoVariant> CryptoNight<Noncer, V> {
 impl<Noncer: Iterator<Item = u32>, V: CryptoVariant> Impl for CryptoNight<Noncer, V> {
     fn next_hash(&mut self, mem: &mut [M128i], blob: &mut [u8]) -> [u8; 32] {
         set_nonce(blob, self.n.next().unwrap_or(0));
-
-        // Create a new state for the new nonce
         let mut new_state = create_state_from_bytes(blob);
         let mut prev_state = std::mem::replace(&mut self.state, new_state);
-
         let prev_var =
             std::mem::replace(&mut self.variant, V::new(blob, self.state.as_u64_array()));
-
         mix(mem, prev_state.as_m128i_array(), prev_var);
         transplode(
             prev_state.as_m128i_array_mut(),
             mem,
             self.state.as_m128i_array(),
         );
-
         finalize(prev_state)
     }
 }
@@ -670,7 +541,6 @@ impl<Noncer: Iterator<Item = u32>, V: CryptoVariant> Impl for CryptoNight<Noncer
 pub fn hash_cn0(blob: &[u8]) -> [u8; 32] {
     hash::<Cnv0>(blob)
 }
-
 pub fn hash_cn2(blob: &[u8]) -> [u8; 32] {
     hash::<Cnv2>(blob)
 }
@@ -679,15 +549,48 @@ pub fn hash<V: CryptoVariant>(blob: &[u8]) -> [u8; 32] {
     let mut mem = Mmap::<[M128i; 1 << 17]>::new(AllocPolicy::AllowSlow);
     let state = create_state_from_bytes(blob);
     let variant = V::new(blob, state.as_u64_array());
-
-    // Clone state since we need to modify it
     let mut state_copy = state.clone();
-
     explode(&mut mem[..], state.as_m128i_array());
     mix(&mut mem[..], state.as_m128i_array(), variant);
     implode(state_copy.as_m128i_array_mut(), &mem[..]);
-
     finalize(state_copy)
+}
+
+// WebAssembly simple memory allocation
+pub struct Mmap<T> {
+    data: Vec<u8>,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Policy {
+    RequireFast,
+    AllowSlow,
+}
+
+impl<T> Mmap<T> {
+    pub fn new(_policy: Policy) -> Self {
+        let size = std::mem::size_of::<T>();
+        Mmap {
+            data: vec![0u8; size],
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T: Sized> std::ops::Deref for Mmap<T> {
+    type Target = [M128i];
+    fn deref(&self) -> &Self::Target {
+        let len = self.data.len() / std::mem::size_of::<M128i>();
+        unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const M128i, len) }
+    }
+}
+
+impl<T: Sized> std::ops::DerefMut for Mmap<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        let len = self.data.len() / std::mem::size_of::<M128i>();
+        unsafe { std::slice::from_raw_parts_mut(self.data.as_mut_ptr() as *mut M128i, len) }
+    }
 }
 
 // WebAssembly bindings
@@ -705,7 +608,6 @@ impl MiningResult {
     pub fn nonce(&self) -> u32 {
         self.nonce
     }
-
     #[wasm_bindgen(getter)]
     pub fn hash(&self) -> Vec<u8> {
         self.hash.clone()
