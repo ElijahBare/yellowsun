@@ -176,12 +176,61 @@ impl CryptoVariant for Cnv2 {
     }
 }
 
-// Implementation of AES encryption round without SIMD
+// At the top of your file or in a separate module
+const fn rotate_left(value: u64, shift: u32) -> u64 {
+    value.rotate_left(shift)
+}
+
+const fn rotate_right(value: u64, shift: u32) -> u64 {
+    value.rotate_right(shift)
+}
+
+// Create the lookup tables using const functions
+const fn create_rotate_left_table(shift: u32) -> [u64; 64] {
+    let mut table = [0u64; 64];
+    let mut i = 0;
+    while i < 64 {
+        // Each entry represents the rotation of the index value
+        table[i] = rotate_left(i as u64, shift);
+        i += 1;
+    }
+    table
+}
+
+const fn create_rotate_right_table(shift: u32) -> [u64; 64] {
+    let mut table = [0u64; 64];
+    let mut i = 0;
+    while i < 64 {
+        table[i] = rotate_right(i as u64, shift);
+        i += 1;
+    }
+    table
+}
+
+// Define the actual tables
+static ROTATE_LEFT_13: [u64; 64] = create_rotate_left_table(13);
+static ROTATE_RIGHT_7: [u64; 64] = create_rotate_right_table(7);
+static ROTATE_LEFT_17: [u64; 64] = create_rotate_left_table(17);
+static ROTATE_RIGHT_11: [u64; 64] = create_rotate_right_table(11);
+
+#[inline(always)]
 fn aes_round(a: M128i, b: M128i) -> M128i {
-    // Simple implementation without actual AES-NI instructions
-    // This is a non-secure fallback that just mixes bits
-    let a0 = a.0.rotate_left(13) ^ b.0.rotate_right(7);
-    let a1 = a.1.rotate_left(17) ^ b.1.rotate_right(11);
+    // For the full 64-bit rotation, we need to use the hardware rotation
+    // but we can optimize by avoiding recomputation for common values
+    let a0 = if a.0 < 64 && b.0 < 64 {
+        // Use lookup table for common cases
+        ROTATE_LEFT_13[(a.0 & 0x3F) as usize] ^ ROTATE_RIGHT_7[(b.0 & 0x3F) as usize]
+    } else {
+        // Fall back to direct computation for other values
+        a.0.rotate_left(13) ^ b.0.rotate_right(7)
+    };
+
+    let a1 = if a.1 < 64 && b.1 < 64 {
+        ROTATE_LEFT_17[(a.1 & 0x3F) as usize] ^ ROTATE_RIGHT_11[(b.1 & 0x3F) as usize]
+    } else {
+        a.1.rotate_left(17) ^ b.1.rotate_right(11)
+    };
+
     M128i(a0, a1)
 }
 
